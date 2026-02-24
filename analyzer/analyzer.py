@@ -1,38 +1,63 @@
-from pathlib import Path
+import sqlite3
 import logging
 import time
 import analyzer.log_config as log_config
 from analyzer.sentiment import NewsSentimentAnalyzer
-from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+DB_PATH = "data/news.db"
+
+
 def run_analysis():
     start_time = time.time()
-    try:
-        BASE_DIR = Path(__file__).resolve().parent.parent
-        file_path = BASE_DIR / "analyzer/data" / "example1.txt"
-        logger.info("프로그램 시작")
+    logger.info("감성 배치 시작")
 
-        if not file_path.exists():
-            logger.warning(f"파일을 찾을 수 없음: {file_path}")
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        #processed가 0인거 실행하기
+        cursor.execute("""
+            SELECT id, content
+            FROM news
+            WHERE is_processed = 0
+        """)
+
+        rows = cursor.fetchall()
+
+        if not rows:
+            logger.info("처리할 뉴스 없음")
             return
 
-        logger.info(f"파일 분석 시작: {file_path.name}")
         analyzer = NewsSentimentAnalyzer()
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            text = f.read()
+        for news_id, content in rows:
+            try:
+                label, score = analyzer.predict(content)
 
-        sentiment, score = analyzer.predict(text)
-        logger.info(f"분석 완료 | 결과: {sentiment} | 점수: {score:.4f}")
+                cursor.execute("""
+                    UPDATE news
+                    SET sentiment_score = ?,
+                        is_processed = 1
+                    WHERE id = ?
+                """, (score, news_id))
+
+                logger.info(
+                    f"ID {news_id} 처리 완료 | 결과: {label} | 점수: {score:.4f}"
+                )
+
+            except Exception:
+                logger.exception(f"ID {news_id} 처리 중 오류 발생")
+
+        conn.commit()
 
     except Exception:
-        logger.exception("실행부에서 치명적 오류 발생")
+        logger.exception("배치 실행 중 치명적 오류 발생")
 
     finally:
+        conn.close()
         elapsed = time.time() - start_time
-        logger.info(f"프로그램 종료 | 총 소요 시간: {elapsed:.2f}초")
+        logger.info(f"감성 배치 종료 | 총 소요 시간: {elapsed:.2f}초")
 
 
 if __name__ == "__main__":

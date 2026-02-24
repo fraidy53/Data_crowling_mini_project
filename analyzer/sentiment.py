@@ -3,11 +3,7 @@ import analyzer.log_config as log_config
 import torch
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-### 로그
-
 logger = logging.getLogger(__name__)
-
-### 감성분석 클래스 생성
 
 class NewsSentimentAnalyzer:
 
@@ -23,7 +19,6 @@ class NewsSentimentAnalyzer:
             )
 
             logger.info("모델 로딩 완료")
-
             self.pos_words = ['상승', '호재', '상승세', '회복', '성장', '긍정', '돌파', '유치', '증가', '최고']
             self.neg_words = ['하락', '악재', '하락세', '위기', '감소', '부정', '붕괴', '손실', '최저', '둔화']
 
@@ -66,16 +61,19 @@ class NewsSentimentAnalyzer:
             else:
                 final_score = model_score
 
-            if final_score > 0.6:
+            scaled_score = (final_score - 0.5) * 2
+
+            if scaled_score > 0.2:
                 label = "긍정"
-            elif final_score < 0.4:
+            elif scaled_score < -0.2:
                 label = "부정"
             else:
                 label = "중립"
 
-            logger.info(f"예측 완료 | 결과: {label} | 점수: {final_score:.4f}")
-
-            return label, final_score
+            logger.info(
+                f"예측 완료 | 결과: {label} | raw: {final_score:.4f} | scaled: {scaled_score:.4f}"
+            )
+            return label, scaled_score
 
         except Exception:
             logger.exception("예측 중 오류 발생")
