@@ -7,9 +7,14 @@ selenium==4.15.0
 pandas==2.1.0
 numpy==1.26.0
 
+# 한국어 처리
+jpype1>=1.6.0
+konlpy>=0.6.0
+
 # 유틸리티
 python-dotenv==1.0.0
 tqdm==4.66.0
+chardet>=5.2.0
 
 # HTML 파싱
 lxml==4.9.3

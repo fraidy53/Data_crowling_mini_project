@@ -35,13 +35,19 @@ ENV/
 *.swo
 *~
 
-# Data
+# Data & Database
 data/*.csv
 data/*.json
+*.db
+*.sqlite3
 !data/README.md
 
 # Logs
+logs/
 *.log
+
+# Environment variables
+.env
 
 # OS
 .DS_Store
