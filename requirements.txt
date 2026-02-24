@@ -1,5 +1,16 @@
-requests
-beautifulsoup4
-pandas
-selenium
-webdriver-manager
+# 데이터 수집
+requests==2.31.0
+beautifulsoup4==4.12.0
+selenium==4.15.0
+
+# 데이터 처리
+pandas==2.1.0
+numpy==1.26.0
+
+# 유틸리티
+python-dotenv==1.0.0
+tqdm==4.66.0
+
+# HTML 파싱
+lxml==4.9.3
+html5lib==1.1
