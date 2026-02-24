@@ -1,16 +1,33 @@
-# Python-generated files
+# Python-generated files & Cache
 __pycache__/
-*.py[oc]
+*.py[ocd]
 build/
 dist/
 wheels/
 *.egg-info
 
 # Virtual environments
-.venv
+venv/
+.venv/
 
 # log
 logs/
+*.log
 
-# Gemini related
+# Data & Database
+*.db
+*.sqlite3
+
+# Environment variables & Secret
+.env
+
+# AI / Tool related
 .gemini/
+
+# IDE / Editor
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
