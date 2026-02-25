@@ -43,6 +43,7 @@ data/*.json
 *.sqlite3
 !data/news.db
 !data/README.md
+!data/news_scraped.db
 data/articles/
 *.bak
 

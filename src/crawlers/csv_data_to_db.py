@@ -28,7 +28,7 @@ logging.basicConfig(
 logger = logging.getLogger("CsvDataToDB")
 
 class DataToDBProcessor:
-    def __init__(self, db_path="data/news.db", max_workers=4):
+    def __init__(self, db_path="data/news_scraped.db", max_workers=4):
         self.db_path = db_path
         self.max_workers = max_workers
         self.region_map = {
