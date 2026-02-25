@@ -7,24 +7,25 @@ import requests
 from bs4 import BeautifulSoup
 import time
 from concurrent.futures import ThreadPoolExecutor
+import urllib3
+
+# SSL 경고 및 종속성 경고 억제
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+os.environ['PYTHONWARNINGS'] = 'ignore:semaphore_tracker:UserWarning'
 
 def ensure_dirs():
     """필요한 디렉토리 생성"""
     for d in ['logs', 'data']:
         os.makedirs(d, exist_ok=True)
 
-def get_logger(name, level=logging.INFO):
+def get_logger(name, level=logging.DEBUG): # 디버깅을 위해 기본 레벨을 DEBUG로 변경
     """실행 시간별 로그 파일 설정"""
     ensure_dirs()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"logs/{name}_{timestamp}.log"
     logger = logging.getLogger(name)
     logger.setLevel(level)
-
-    # 기존 핸들러 제거
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-
+    
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setFormatter(formatter)
@@ -35,12 +36,18 @@ def get_logger(name, level=logging.INFO):
     return logger
 
 def get_common_headers():
-    """공통 HTTP 헤더 (연결 유지 설정 포함)"""
+    """브라우저와 최대한 유사한 공통 HTTP 헤더"""
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Sec-Ch-Ua": '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+        "Upgrade-Insecure-Requests": "1"
     }
 
 def common_parse_date(date_str):
@@ -86,24 +93,30 @@ def clean_text(text):
 def fetch_url(url, headers, logger, session=None, retries=3, backoff_factor=1.5):
     """재시도 로직이 포함된 URL 요청 함수"""
     fetcher = session if session else requests
+    
     for i in range(retries):
         try:
-            response = fetcher.get(url, headers=headers, timeout=10)
+            # 타임아웃 20초, SSL 검증 무시
+            response = fetcher.get(url, headers=headers, timeout=20, verify=False)
             if response.status_code == 200:
-                # 인코딩 설정 (가장 중요: 깨짐 방지)
-                if response.encoding == 'ISO-8859-1':
-                    response.encoding = response.apparent_encoding
+                # UTF-8 강제 지정 후 즉시 반환
+                response.encoding = 'utf-8'
                 return response
-            elif response.status_code in [403, 429, 500, 502, 503, 504]:
-                wait_time = backoff_factor ** i
-                logger.warning(f"Status {response.status_code} for {url}. Retrying in {wait_time:.1f}s... ({i+1}/{retries})")
-                time.sleep(wait_time)
+            elif response.status_code in [403, 401, 429]:
+                print(f"[DEBUG] HTTP {response.status_code} Error: {url}")
+                logger.warning(f"Status {response.status_code} for {url}. ({i+1}/{retries})")
+                time.sleep(backoff_factor ** i)
             else:
+                print(f"[DEBUG] HTTP Error {response.status_code}: {url}")
                 logger.error(f"Failed to fetch {url}: Status {response.status_code}")
                 return None
-        except (requests.exceptions.RequestException, Exception) as e:
+        except Exception as e:
+            # 에러의 실체를 콘솔에 즉시 출력
+            print(f"\n[DEBUG] Error Fetching URL: {url}")
+            print(f"[DEBUG] Exception Type: {type(e).__name__}")
+            print(f"[DEBUG] Exception Message: {str(e)}")
             wait_time = backoff_factor ** i
-            logger.warning(f"Error fetching {url}: {e}. Retrying in {wait_time:.1f}s... ({i+1}/{retries})")
+            logger.error(f"Error fetching {url}: {str(e)} (Type: {type(e).__name__})")
             time.sleep(wait_time)
     
     logger.error(f"Max retries exceeded for {url}")
@@ -116,8 +129,12 @@ def fetch_article_details(url, selectors, headers, logger, session=None):
     try:
         response = fetch_url(url, headers, logger, session=session)
         if response and response.status_code == 200:
-            response.encoding = response.apparent_encoding
-            soup = BeautifulSoup(response.text, 'html.parser')
+            # 인코딩 오류 방지: ISO-8859-1로 잘못 감지되는 경우 utf-8 강제 시도
+            if response.encoding == 'ISO-8859-1':
+                response.encoding = 'utf-8'
+            
+            # BeautifulSoup에서 명시적으로 utf-8을 감지하도록 content 사용
+            soup = BeautifulSoup(response.content, 'html.parser', from_encoding='utf-8')
             
             # Sub Title
             st_sel = selectors.get('sub_title')
