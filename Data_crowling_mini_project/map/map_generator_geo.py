@@ -1,366 +1,186 @@
-"""
-Folium 지도 생성기 (GeoJSON 행정구역 경계선 버전)
-뉴스 데이터를 인터랙티브 지도에 시각화하며, 실제 행정구역 경계선을 표시합니다
-"""
-
 import os
 import json
 import folium
-from folium import IFrame, GeoJson, GeoJsonTooltip, GeoJsonPopup
+import sqlite3
+import pandas as pd
+from folium import IFrame, GeoJson
 from folium.features import DivIcon
 from typing import List, Dict
 import html
 
-from db_loader import NewsDBLoader
+# 기존 유틸리티 임포트
 from region_coords import KOREA_CENTER, DEFAULT_ZOOM, REGION_COORDS
-from color_mapper import get_sentiment_label, get_region_color_by_avg
-from region_mapper import get_geojson_regions, get_db_region
-
+from color_mapper import get_sentiment_label, get_region_color_by_avg 
+from region_mapper import get_db_region
 
 class NewsMapGeneratorGeo:
-    """GeoJSON 기반 뉴스 지도 생성기"""
+    """GeoJSON 기반 뉴스 지도 생성기 (DB 통합 & 사이드 패널 소스코드 반영)"""
     
-    # DB 지역들을 6개 주요 지역으로 통합하는 매핑
     REGION_CONSOLIDATION = {
         '서울': ['서울'],
         '경기도': ['경기도', '인천'],
         '강원도': ['강원도'],
-        '충청도': ['충청도'],
-        '경상도': ['경상도', '경남', '경북'],
-        '전라도': ['전라도', '전남']
+        '충청도': ['충청도', '대전', '세종'],
+        '경상도': ['경상도', '경남', '경북', '부산', '대구', '울산'],
+        '전라도': ['전라도', '전남', '전북', '광주']
     }
 
-    # 경제 관련 키워드 목록
-    ECON_KEYWORDS = [
-        '경제', '증시', '주가', '코스피', '코스닥', '환율', '금리', '물가', '인플레이션',
-        '금융', '은행', '대출', '채권', '시장', '투자', '기업', '산업', '경기', '성장',
-        '수출', '수입', '무역', '부동산', '주택', '아파트', '매출', '실적', '영업이익',
-        '적자', '흑자', '세금', '재정'
-    ]
-    
-    def __init__(self, db_path: str = None, geojson_path: str = None):
-        """
-        Args:
-            db_path: 데이터베이스 경로
-            geojson_path: GeoJSON 파일 경로
-        """
-        self.loader = NewsDBLoader(db_path)
+    def __init__(self, geojson_path: str = None):
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        project_root = os.path.dirname(current_dir)
         
-        # GeoJSON 파일 경로 설정
-        if geojson_path is None:
-            current_dir = os.path.dirname(os.path.abspath(__file__))
-            geojson_path = os.path.join(os.path.dirname(current_dir), 'skorea-provinces-geo.json')
+        # DB 경로 설정
+        self.db_main = os.path.join(project_root, 'data', 'news.db')
+        self.db_scraped = os.path.join(project_root, 'data', 'news_scraped.db')
         
-        self.geojson_path = geojson_path
+        self.geojson_path = geojson_path or os.path.join(project_root, 'skorea-provinces-geo.json')
         self.geojson_data = None
         self.map = None
-        
-    def load_geojson(self):
-        """GeoJSON 파일 로드"""
-        try:
-            with open(self.geojson_path, 'r', encoding='utf-8') as f:
-                self.geojson_data = json.load(f)
-            print(f"✅ GeoJSON 로드 완료: {len(self.geojson_data.get('features', []))}개 지역")
-            return True
-        except Exception as e:
-            print(f"❌ GeoJSON 로드 실패: {e}")
-            return False
-    
-    def create_map(self):
-        """기본 지도 생성"""
-        self.map = folium.Map(
-            location=KOREA_CENTER,
-            zoom_start=DEFAULT_ZOOM,
-            tiles='OpenStreetMap',
-            control_scale=True
-        )
-        return self.map
-    
+
+    def _get_integrated_conn(self):
+        """news.db와 news_scraped.db 통합 연결"""
+        conn = sqlite3.connect(self.db_main)
+        cursor = conn.cursor()
+        if os.path.exists(self.db_scraped):
+            cursor.execute(f"ATTACH DATABASE '{self.db_scraped}' AS scraped")
+        return conn
+
     def get_region_statistics(self):
-        """각 지역의 통계 계산 - DB 지역들을 6개 주요 지역으로 통합"""
-        db_stats = self.loader.get_region_stats()
+        """통합 DB에서 지역별 통계 추출"""
+        conn = self._get_integrated_conn()
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA database_list")
+        databases = [row[1] for row in cursor.fetchall()]
+        
+        subquery = "SELECT region, sentiment_score FROM main.news"
+        if 'scraped' in databases:
+            subquery += " UNION ALL SELECT region, sentiment_score FROM scraped.news"
+            
+        query = f"""
+        SELECT region, COUNT(*) as count,
+               SUM(CASE WHEN sentiment_score > 0 THEN 1 ELSE 0 END) as positive_count,
+               SUM(CASE WHEN sentiment_score < 0 THEN 1 ELSE 0 END) as negative_count
+        FROM ({subquery}) GROUP BY region
+        """
+        db_stats_df = pd.read_sql_query(query, conn)
+        conn.close()
+        
+        db_stats = db_stats_df.set_index('region').to_dict('index')
         consolidated_stats = {}
         
-        # 6개 주요 지역으로 통합
-        for main_region, db_regions in self.REGION_CONSOLIDATION.items():
-            total_count = 0
-            total_sentiment = 0.0
-            total_positive = 0
-            total_negative = 0
-            weight_sum = 0
+        for main_reg, sub_regs in self.REGION_CONSOLIDATION.items():
+            t_cnt = t_pos = t_neg = 0
+            for r in sub_regs:
+                if r in db_stats:
+                    s = db_stats[r]
+                    t_cnt += s['count']; t_pos += s['positive_count']; t_neg += s['negative_count']
             
-            # 해당 주요 지역에 속하는 모든 DB 지역 통합
-            for db_region in db_regions:
-                if db_region in db_stats:
-                    stat = db_stats[db_region]
-                    count = stat['count']
-                    total_count += count
-                    total_positive += stat['positive_count']
-                    total_negative += stat['negative_count']
-                    
-                    # 가중 평균 감성 계산 (뉴스 개수로 가중)
-                    if count > 0:
-                        total_sentiment += stat['avg_sentiment'] * count
-                        weight_sum += count
-            
-            # 평균 계산
-            avg_sentiment = (total_sentiment / weight_sum) if weight_sum > 0 else 0.0
-            
-            consolidated_stats[main_region] = {
-                'count': total_count,
-                'avg_sentiment': avg_sentiment,
-                'positive_count': total_positive,
-                'negative_count': total_negative
+            consolidated_stats[main_reg] = {
+                'count': t_cnt, 'neg_ratio': (t_neg / t_cnt * 100) if t_cnt > 0 else 0.0,
+                'positive_count': t_pos, 'negative_count': t_neg
             }
-        
         return consolidated_stats
 
-    def _split_keywords(self, keyword_text: str) -> List[str]:
-        """키워드 문자열을 리스트로 분리"""
-        if not keyword_text:
-            return []
+    def get_latest_news_integrated(self, db_region: str, limit: int = 5):
+        """[rowid 에러 해결] 통합 DB에서 최신 뉴스 리스트 추출"""
+        conn = self._get_integrated_conn()
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA database_list")
+        databases = [row[1] for row in cursor.fetchall()]
+        
+        sub_regions = self.REGION_CONSOLIDATION.get(db_region, [db_region])
+        placeholders = ', '.join(['?'] * len(sub_regions))
+        
+        subquery = "SELECT title, sentiment_score, url, keyword, region FROM main.news"
+        if 'scraped' in databases:
+            subquery += " UNION ALL SELECT title, sentiment_score, url, keyword, region FROM scraped.news"
+            
+        query = f"SELECT title, sentiment_score, url, keyword FROM ({subquery}) WHERE region IN ({placeholders}) LIMIT ?"
+        
+        df = pd.read_sql_query(query, conn, params=(*sub_regions, limit))
+        conn.close()
+        return df.to_dict('records')
 
-        separators = [',', '|', '/', ';']
-        normalized = keyword_text
-        for sep in separators:
-            normalized = normalized.replace(sep, ',')
-
-        raw_tokens = [token.strip() for token in normalized.replace('\n', ',').split(',')]
-        tokens = []
-        for token in raw_tokens:
-            if not token:
-                continue
-            # 공백으로 나뉜 키워드도 분해
-            for sub in token.split():
-                sub = sub.strip()
-                if sub:
-                    tokens.append(sub)
-
-        return tokens
-
-    def _is_economic_keyword(self, token: str) -> bool:
-        """경제 관련 키워드인지 판단"""
-        for econ in self.ECON_KEYWORDS:
-            if econ in token:
-                return True
-        return False
-
-    def get_top_economic_keywords(self, db_region: str, limit: int = 5) -> List[str]:
-        """지역별 경제 관련 키워드 상위 N개 추출"""
-        from collections import Counter
-
-        db_regions = self.REGION_CONSOLIDATION.get(db_region, [db_region])
-        keyword_texts = self.loader.get_keywords_by_regions(db_regions)
-
-        counter = Counter()
-        for keyword_text in keyword_texts:
-            for token in self._split_keywords(keyword_text):
-                if self._is_economic_keyword(token):
-                    counter[token] += 1
-
-        if not counter:
-            return []
-
-        return [token for token, _ in counter.most_common(limit)]
-    
-    def get_top_keywords(self, db_region: str, limit: int = 10) -> List[str]:
-        """지역별 전체 키워드 상위 N개 추출"""
-        from collections import Counter
-
-        db_regions = self.REGION_CONSOLIDATION.get(db_region, [db_region])
-        keyword_texts = self.loader.get_keywords_by_regions(db_regions)
-
-        counter = Counter()
-        for keyword_text in keyword_texts:
-            for token in self._split_keywords(keyword_text):
-                if len(token) >= 2:  # 2글자 이상만
-                    counter[token] += 1
-
-        if not counter:
-            return []
-
-        return [token for token, _ in counter.most_common(limit)]
-    
     def create_popup_html(self, db_region: str, stat: Dict, max_news: int = 5):
-        """팝업 HTML 생성"""
-        news_list = self.loader.get_latest_news_by_region(db_region, limit=max_news)
+        """가로형 3열 UI 팝업"""
+        news_list = self.get_latest_news_integrated(db_region, limit=max_news)
+        ratio_color = '#f44336' if stat['neg_ratio'] > 51 else '#2196F3'
         
         html_content = f"""
-        <div style="width: 700px; padding: 15px; font-family: 'Malgun Gothic', 'Arial', sans-serif; box-sizing: border-box; overflow: hidden;">
-            <h3 style="margin-top: 0; margin-bottom: 10px; color: #fff; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
-                       padding: 12px 15px; border-radius: 5px; text-align: center; word-wrap: break-word; overflow-wrap: break-word;">
-                📍 {db_region} 지역 뉴스
-            </h3>
-            
-            <div style="background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%); padding: 12px; margin-bottom: 15px; 
-                        border-radius: 5px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center;">
-                <div>
-                    <div style="font-size: 0.8em; color: #666; font-weight: bold;">📰 뉴스</div>
-                    <div style="font-size: 1.3em; color: #2196F3; font-weight: bold;">{stat['count']}개</div>
-                </div>
-                <div>
-                    <div style="font-size: 0.8em; color: #666; font-weight: bold;">😊 긍정</div>
-                    <div style="font-size: 1.3em; color: #4CAF50; font-weight: bold;">{stat['positive_count']}개</div>
-                </div>
-                <div>
-                    <div style="font-size: 0.8em; color: #666; font-weight: bold;">😔 부정</div>
-                    <div style="font-size: 1.3em; color: #f44336; font-weight: bold;">{stat['negative_count']}개</div>
-                </div>
+        <div style="width: 700px; padding: 15px; font-family: 'Malgun Gothic', sans-serif;">
+            <h3 style="margin-bottom: 10px; color: #fff; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); 
+                       padding: 12px; border-radius: 5px; text-align: center;">📍 {db_region} 지역 뉴스</h3>
+            <div style="background: #f8f9fa; padding: 15px; margin-bottom: 15px; border-radius: 5px; 
+                        display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; text-align: center; border: 1px solid #ddd;">
+                <div><div style="color: #666; font-size: 0.9em;">📰 뉴스</div><div style="font-size: 1.4em; color: #2196F3; font-weight: bold;">{stat['count']}개</div></div>
+                <div><div style="color: #666; font-size: 0.9em;">😊 긍정</div><div style="font-size: 1.4em; color: #4CAF50; font-weight: bold;">{stat['positive_count']}개</div></div>
+                <div><div style="color: #666; font-size: 0.9em;">😔 부정</div><div style="font-size: 1.4em; color: #f44336; font-weight: bold;">{stat['negative_count']}개</div></div>
             </div>
-            
-            <div style="background-color: #f0f4f8; padding: 10px; margin-bottom: 15px; border-left: 4px solid #667eea; border-radius: 3px; 
-                        word-wrap: break-word; overflow-wrap: break-word;">
-                <span style="font-size: 0.9em; color: #666;">평균 감성: </span>
-                <span style="font-weight: bold; font-size: 1.1em; color: {'#4CAF50' if stat['avg_sentiment'] > 0 else '#f44336' if stat['avg_sentiment'] < 0 else '#999'};">
-                    {stat['avg_sentiment']:+.3f}
-                </span>
-                <span style="font-size: 0.85em; color: #999;">({get_sentiment_label(stat['avg_sentiment'])})</span>
+            <div style="margin-bottom: 15px; padding: 10px; background: #fff; border-left: 5px solid {ratio_color};">
+                부정 기사 비율: <b style="color: {ratio_color};">{stat['neg_ratio']:.1f}%</b> ({'부정 위험' if stat['neg_ratio'] > 51 else '긍정 우세'})
             </div>
-            
-            <div style="border-top: 2px solid #ddd; padding-top: 10px;">
-                <h4 style="margin: 10px 0; color: #333; font-size: 0.95em;">📋 뉴스 목록</h4>
-                <div style="max-height: 350px; overflow-y: auto;">
+            <div style="max-height: 300px; overflow-y: auto;">
         """
-        
-        for i, news in enumerate(news_list, 1):
-            title = html.escape(news.get('title', '제목 없음'))
-            sentiment = news.get('sentiment_score') or 0.0
-            url = news.get('url', '#')
-            
-            if sentiment > 0.5:
-                sentiment_color = '#0D47A1'
-                sentiment_emoji = '😊😊'
-            elif sentiment > 0:
-                sentiment_color = '#81C784'
-                sentiment_emoji = '😊'
-            elif sentiment < -0.5:
-                sentiment_color = '#B71C1C'
-                sentiment_emoji = '😔😔'
-            elif sentiment < 0:
-                sentiment_color = '#f44336'
-                sentiment_emoji = '😔'
-            else:
-                sentiment_color = '#9E9E9E'
-                sentiment_emoji = '😐'
-
+        for news in news_list:
+            s_val = news['sentiment_score'] or 0.0
+            s_color = '#2196F3' if s_val > 0 else '#f44336'
             html_content += f"""
-            <div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #eee;">
-                <div style="margin-bottom: 6px; word-wrap: break-word; overflow-wrap: break-word;">
-                    <span style="color: #1976D2; font-size: 0.9em; font-weight: 500;">
-                        • <a href="{url}" target="_blank" style="color: #1976D2; text-decoration: none;">
-                            {title}
-                        </a>
-                    </span>
-                </div>
-                <div style="font-size: 0.8em; margin-left: 12px;">
-                    <span style="background-color: {sentiment_color}; color: white; padding: 3px 10px; border-radius: 12px; white-space: nowrap; font-size: 0.85em;">
-                        {sentiment_emoji} {sentiment:+.2f}
-                    </span>
-                </div>
-            </div>
-            """
-        
-        if stat['count'] > max_news:
-            html_content += f"""
-            <div style="text-align: center; padding: 10px; color: #999; font-size: 0.85em; 
-                        background-color: #f5f5f5; border-radius: 3px; margin-top: 10px;">
-                ⬇️ <strong>+ {stat['count'] - max_news}개 더 많은 뉴스</strong>
-            </div>
-            """
-        
-        html_content += """</div></div></div>"""
-        return html_content
+            <div style="margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">
+                <a href="{news['url']}" target="_blank" style="text-decoration: none; color: #333; font-size: 0.95em;">• {html.escape(news['title'])}</a>
+                <div style="margin-top: 4px;"><span style="background: {s_color}; color: white; padding: 2px 6px; border-radius: 10px; font-size: 0.8em;">{s_val:+.2f}</span></div>
+            </div>"""
+        return html_content + "</div></div>"
 
     def add_region_labels(self):
-        """지도에 지역명 라벨 고정 표시"""
+        """지역명 가로 출력 고정"""
         for region, coord in REGION_COORDS.items():
-            label_html = f"""
-            <div style="font-size: 15px; font-weight: 700; color: #111; white-space: nowrap;
-                        text-shadow: 0 1px 2px rgba(255,255,255,0.9);
-                        transform: translate(-50%, -50%); pointer-events: none;">
-                {region}
-            </div>
-            """
-            folium.Marker(
-                location=coord,
-                icon=DivIcon(html=label_html, icon_anchor=(0, 0)),
-                interactive=False
-            ).add_to(self.map)
-    
-    def add_geojson_layer(self, max_news: int = 10):
-        """GeoJSON 레이어 추가"""
-        if not self.geojson_data:
-            return
+            label_html = f'<div style="font-size: 13pt; font-weight: bold; color: black; white-space: nowrap; text-shadow: 2px 2px 2px white;">{region}</div>'
+            folium.Marker(location=coord, icon=DivIcon(html=label_html, icon_size=(100, 20), icon_anchor=(50, 10)), interactive=False).add_to(self.map)
+
+    def _split_keywords(self, text):
+        if not text: return []
+        return [t.strip() for t in text.replace('|', ',').split(',') if t.strip()]
+
+    def add_legend(self):
+        legend_html = '''
+        <div style="position: fixed; bottom: 50px; right: 50px; width: 200px; background: white; border: 2px solid grey; z-index: 9999; padding: 10px; border-radius: 5px;">
+            <p style="margin:0;"><b>🚩 부정 기사 비율</b></p>
+            <p style="margin:5px 0;"><span style="background: red; width: 20px; height: 12px; display: inline-block;"></span> 위험 (51%+)</p>
+            <p style="margin:5px 0;"><span style="background: blue; width: 20px; height: 12px; display: inline-block;"></span> 우세 (50%-)</p>
+        </div>'''
+        self.map.get_root().html.add_child(folium.Element(legend_html))
+
+    def generate(self, output_file: str = 'news_map_geo.html'):
+        with open(self.geojson_path, 'r', encoding='utf-8') as f:
+            self.geojson_data = json.load(f)
         
-        region_stats = self.get_region_statistics()
-        EXCLUDED_REGIONS = ['Jeju', 'Dokdo', 'Ulleung-gun']  # 독도, 울릉군 등 동쪽 섬 제외
+        self.map = folium.Map(location=KOREA_CENTER, zoom_start=DEFAULT_ZOOM, tiles='OpenStreetMap')
+        stats = self.get_region_statistics()
         
         for feature in self.geojson_data['features']:
-            geojson_region = feature['properties'].get('NAME_1')
-            if geojson_region in EXCLUDED_REGIONS:
-                continue
-            db_region = get_db_region(geojson_region)
+            name = feature['properties'].get('NAME_1')
+            if name in ['Jeju', 'Dokdo', 'Ulleung-gun']: continue
+            db_region = get_db_region(name)
+            stat = stats.get(db_region, {'count': 0, 'neg_ratio': 0, 'positive_count': 0, 'negative_count': 0})
             
-            if db_region is None or db_region not in region_stats:
-                fill_color = '#CCCCCC'
-                fill_opacity = 0.3
-                stat = {'count': 0, 'avg_sentiment': 0, 'positive_count': 0, 'negative_count': 0}
-            else:
-                stat = region_stats[db_region]
-                fill_color = get_region_color_by_avg(stat['avg_sentiment'])
-                fill_opacity = 0.6
+            color = get_region_color_by_avg(stat['neg_ratio']) if stat['count'] > 0 else '#CCCCCC'
+            popup_html = self.create_popup_html(db_region, stat)
             
-            feature_collection = {'type': 'FeatureCollection', 'features': [feature]}
-            
-            style_function = lambda x, color=fill_color, opacity=fill_opacity: {
-                'fillColor': color, 'fillOpacity': opacity, 'color': '#333333', 'weight': 1.5, 'opacity': 0.8
-            }
-            
-            highlight_function = lambda x: {'fillOpacity': 0.8, 'weight': 3, 'color': '#FF5722'}
-            
-            if db_region and stat['count'] > 0:
-                popup_html = self.create_popup_html(db_region, stat, max_news)
-                popup = folium.Popup(IFrame(html=popup_html, width=730, height=500), max_width=750)
-            else:
-                popup = folium.Popup(f"<div style='padding: 10px;'><b>{geojson_region}</b><br/>뉴스 데이터 없음</div>", max_width=200)
-            
-            GeoJson(
-                feature_collection,
-                style_function=style_function,
-                highlight_function=highlight_function,
-                popup=popup,
-                name=geojson_region
+            folium.GeoJson(
+                feature, 
+                style_function=lambda x, c=color: {'fillColor': c, 'fillOpacity': 0.6, 'color': 'black', 'weight': 1.2},
+                popup=folium.Popup(IFrame(popup_html, width=730, height=520), max_width=750)
             ).add_to(self.map)
-    
-    def add_legend(self):
-        """범례 추가"""
-        legend_html = '''
-        <div style="position: fixed; bottom: 50px; right: 50px; width: 200px; 
-                    background-color: white; border: 2px solid grey; border-radius: 5px;
-                    z-index: 9999; font-size: 14px; padding: 10px; box-shadow: 0 0 10px rgba(0,0,0,0.3);">
-            <p style="margin: 0 0 10px 0; font-weight: bold; font-size: 16px;">📊 감성 지수</p>
-            <p style="margin: 5px 0;"><span style="background-color: #0D47A1; width: 20px; height: 15px; display: inline-block; margin-right: 5px;"></span>매우 긍정적 (> 0.8)</p>
-            <p style="margin: 5px 0;"><span style="background-color: #81C784; width: 20px; height: 15px; display: inline-block; margin-right: 5px;"></span>긍정적 (> 0)</p>
-            <p style="margin: 5px 0;"><span style="background-color: #FFFFFF; border: 1px solid #ccc; width: 20px; height: 15px; display: inline-block; margin-right: 5px;"></span>중립 (= 0)</p>
-            <p style="margin: 5px 0;"><span style="background-color: #FF5252; width: 20px; height: 15px; display: inline-block; margin-right: 5px;"></span>부정적 (< 0)</p>
-            <p style="margin: 5px 0;"><span style="background-color: #B71C1C; width: 20px; height: 15px; display: inline-block; margin-right: 5px;"></span>매우 부정적 (< -0.5)</p>
-        </div>
-        '''
-        self.map.get_root().html.add_child(folium.Element(legend_html))
-    
-    def generate(self, output_file: str = 'news_map_geo.html', max_news: int = 10):
-        """지도 생성 및 저장"""
-        self.load_geojson()
-        self.create_map()
-        self.add_geojson_layer(max_news=max_news)
+
         self.add_region_labels()
         self.add_legend()
         self.map.save(output_file)
         self.add_side_panel_with_events(output_file)
-        print(f"✅ 완료! 파일 위치: {os.path.abspath(output_file)}")
-    
+        print(f"✅ 통합 완료: {os.path.abspath(output_file)}")
+
+    # --- 요청하신 사이드 패널 소스코드 삽입 (통합 DB 리스트 연결 수정) ---
     def add_side_panel_with_events(self, html_file: str):
-        """HTML 파일에 사이드 패널 및 리셋 이벤트 추가"""
+        """사이드 패널(키워드 창) 복구 및 마우스 이벤트 로직"""
         with open(html_file, 'r', encoding='utf-8') as f:
             html_content = f.read()
         
@@ -368,134 +188,89 @@ class NewsMapGeneratorGeo:
         region_data = {}
         for main_region in self.REGION_CONSOLIDATION.keys():
             if main_region in stats and stats[main_region]['count'] > 0:
-                latest_news = self.loader.get_latest_news_by_region(main_region, limit=5)
+                # [수정] loader 대신 클래스 내 통합 뉴스 메서드 사용
+                latest_news = self.get_latest_news_integrated(main_region, limit=5)
                 news_items = []
                 for news in latest_news:
-                    title = news.get('title', '제목 없음')
-                    keyword_str = news.get('keyword', '-')
-                    economic_keywords = []
-                    if keyword_str and keyword_str != '-':
-                        all_tokens = self._split_keywords(keyword_str)
-                        for token in all_tokens:
-                            if self._is_economic_keyword(token) and len(economic_keywords) < 5:
-                                economic_keywords.append(token)
-                    news_items.append({'title': title, 'keywords': economic_keywords})
+                    keywords = []
+                    k_str = news.get('keyword', '-')
+                    if k_str and k_str != '-':
+                        for token in self._split_keywords(k_str):
+                            if len(keywords) < 5:
+                                keywords.append(token)
+                    news_items.append({'title': news.get('title', '제목 없음'), 'keywords': keywords})
                 region_data[main_region] = news_items
         
         region_data_json = json.dumps(region_data, ensure_ascii=False)
         
         custom_code = f"""
         <style>
-            .leaflet-tooltip {{ display: none !important; }}
-            #map {{ margin-right: 450px; }}
+            #map {{ margin-right: 450px !important; }}
             #info-panel {{
                 position: fixed; right: 20px; top: 80px; width: 420px;
-                max-height: 80vh; overflow-y: auto; background: white;
+                max-height: 85vh; overflow-y: auto; background: white;
                 border: 2px solid #E91E63; border-radius: 8px; padding: 15px;
                 box-shadow: 0 4px 12px rgba(0,0,0,0.2); z-index: 1000;
-                font-family: '맑은고딕', sans-serif;
+                font-family: 'Malgun Gothic', sans-serif;
             }}
-            #info-panel h3 {{ margin: 0 0 12px 0; color: #E91E63; border-bottom: 2px solid #E91E63; padding-bottom: 6px; font-size: 15px; }}
-            .news-item {{ margin-bottom: 10px; padding-left: 8px; border-left: 3px solid #E91E63; }}
-            .news-title {{ font-weight: 500; color: #333; font-size: 13px; line-height: 1.4; }}
-            .news-keywords {{ font-size: 11px; color: #1976D2; }}
+            #info-panel h3 {{ margin: 0 0 12px 0; color: #E91E63; border-bottom: 2px solid #E91E63; padding-bottom: 6px; font-size: 16px; }}
+            .news-item {{ margin-bottom: 12px; padding-left: 10px; border-left: 3px solid #E91E63; }}
+            .news-title {{ font-weight: bold; color: #333; font-size: 13px; line-height: 1.4; }}
+            .news-keywords {{ font-size: 11px; color: #1976D2; margin-top: 4px; }}
         </style>
-        
-        <div id="info-panel">
-            <h3>📍 지역을 선택하세요</h3>
-            <p style="color: #999; font-size: 12px;">지도에서 지역에 마우스를 올리거나 클릭하면 정보가 표시됩니다.</p>
-        </div>
         
         <script>
             var regionNewsData = {region_data_json};
             var regionMapping = {{
-                'Seoul': '서울', 'Gyeonggi-do': '경기도', 'Gangwon-do': '강원도',
-                'Chungcheongnam-do': '충청도', 'Chungcheongbuk-do': '충청도',
-                'Gyeongsangnam-do': '경상도', 'Gyeongsangbuk-do': '경상도',
-                'Jeollanam-do': '전라도', 'Jeollabuk-do': '전라도',
-                'Incheon': '경기도', 'Daejeon': '충청도', 'Daegu': '경상도',
-                'Busan': '경상도', 'Ulsan': '경상도', 'Gwangju': '전라도'
+                'Seoul': '서울', 'Gyeonggi-do': '경기도', 'Incheon': '경기도',
+                'Gangwon-do': '강원도', 'Chungcheongnam-do': '충청도', 'Chungcheongbuk-do': '충청도',
+                'Daejeon': '충청도', 'Gyeongsangnam-do': '경상도', 'Gyeongsangbuk-do': '경상도',
+                'Busan': '경상도', 'Daegu': '경상도', 'Ulsan': '경상도',
+                'Jeollanam-do': '전라도', 'Jeollabuk-do': '전라도', 'Gwangju': '전라도'
             }};
 
-            function resetPanel() {{
+            function updatePanel(name) {{
+                var dbName = regionMapping[name];
+                var data = regionNewsData[dbName];
                 var panel = document.getElementById('info-panel');
-                panel.innerHTML = '<h3>📍 지역을 선택하세요</h3><p style="color: #999; font-size: 12px;">지도에서 지역에 마우스를 올리면 정보가 표시됩니다.</p>';
-                panel.style.display = '';
-            }}
-
-            setTimeout(function() {{
-                var mapInstance = null;
-                for (var key in window) {{
-                    if (key.startsWith('map_') && window[key] && typeof window[key].on === 'function') {{
-                        mapInstance = window[key];
-                        break;
-                    }}
-                }}
-
-                if (mapInstance) {{
-                    // 빈 공간 클릭 시 info-panel 다시 보이게
-                    mapInstance.on('click', function(e) {{
-                        var panel = document.getElementById('info-panel');
-                        if (panel) {{
-                            panel.style.display = 'block';
-                            resetPanel();
-                        }}
-                    }});
-
-                    mapInstance.eachLayer(function(layer) {{
-                        if (layer.feature && layer.feature.properties && layer.feature.properties.NAME_1) {{
-                            var geoJsonName = layer.feature.properties.NAME_1;
-
-                            layer.on('mouseover', function(e) {{
-                                var dbRegion = regionMapping[geoJsonName];
-                                var panel = document.getElementById('info-panel');
-                                if (panel) {{
-                                    panel.style.display = 'block';
-                                    showRegionInfo(dbRegion, regionNewsData[dbRegion]);
-                                    console.log('info-panel show (mouseover):', dbRegion);
-                                }}
-                            }});
-
-                            // 클릭 시 info-panel 숨기기
-                            layer.on('click', function(e) {{
-                                var panel = document.getElementById('info-panel');
-                                if (panel) {{
-                                    panel.style.display = 'none';
-                                    console.log('info-panel hide (region click)');
-                                }}
-                            }});
-
-                            // 마우스가 레이어를 벗어날 때 info-panel 다시 보이게 (선택)
-                            layer.on('mouseout', function(e) {{
-                                var panel = document.getElementById('info-panel');
-                                if (panel) {{
-                                    panel.style.display = 'none';
-                                    console.log('info-panel hide (mouseout)');
-                                }}
-                            }});
-                        }}
-                    }});
-                }}
-            }}, 2000);
-
-            function showRegionInfo(regionName, newsItems) {{
-                var panel = document.getElementById('info-panel');
-                var html = '<h3>📍 ' + regionName + ' 주요 뉴스 & 키워드</h3>';
-                newsItems.forEach(function(news) {{
+                if(!data) return;
+                
+                var html = '<h3>📍 ' + dbName + ' 주요 뉴스 & 키워드</h3>';
+                data.forEach(function(item) {{
                     html += '<div class="news-item">';
-                    html += '<div class="news-title">• ' + news.title + '</div>';
-                    html += '<div class="news-keywords">🔍 키워드: ' + news.keywords.join(', ') + '</div>';
+                    html += '<div class="news-title">• ' + item.title + '</div>';
+                    html += '<div class="news-keywords">🔍 키워드: ' + item.keywords.join(', ') + '</div>';
                     html += '</div>';
                 }});
                 panel.innerHTML = html;
+                panel.style.display = 'block';
             }}
+
+            window.onload = function() {{
+                var mapElements = document.getElementsByClassName('folium-map');
+                if (mapElements.length > 0) {{
+                    var mapId = mapElements[0].id;
+                    var mapInstance = window[mapId];
+                    
+                    mapInstance.eachLayer(function(layer) {{
+                        if (layer.feature) {{
+                            layer.on('mouseover', function(e) {{
+                                updatePanel(e.target.feature.properties.NAME_1);
+                            }});
+                            layer.on('mouseout', function(e) {{
+                                document.getElementById('info-panel').style.display = 'none';
+                            }});
+                        }}
+                    }});
+                }}
+            }};
         </script>
+        <div id="info-panel" style="display:none;"></div>
         """
         html_content = html_content.replace('</body>', custom_code + '</body>')
         with open(html_file, 'w', encoding='utf-8') as f:
             f.write(html_content)
 
-
 if __name__ == '__main__':
     generator = NewsMapGeneratorGeo()
-    generator.generate('news_map_geo.html', max_news=10)
+    generator.generate()
