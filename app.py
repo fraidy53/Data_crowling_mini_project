@@ -123,23 +123,55 @@ def get_issue_list_data(region):
         return df
     except: return pd.DataFrame()
 
-def get_chart_data(start_date, end_date, region, asset_type):
-    query = "SELECT date(published_time) as date, sentiment_score, url, region FROM news WHERE date(published_time) BETWEEN ? AND ?"
+# [주석] 사용자가 선택한 상위 지역명(전라도, 경상도 등)을 하위 행정구역(전남, 전북 등)과 매칭하여 통합 필터링합니다.
+def get_chart_data(start_date, end_date, region, asset_type="코스피(KOSPI)"):
+    # [주석] DB에서 데이터를 가져올 때 날짜, 감성점수, 지역 정보를 모두 로드합니다.
+    query = "SELECT date(published_time) as date, sentiment_score, region FROM news WHERE date(published_time) BETWEEN ? AND ?"
     df = get_combined_df(query, params=(start_date.isoformat(), end_date.isoformat()))
-    if df.empty: return pd.DataFrame()
+    
+    if df.empty:
+        return pd.DataFrame()
+
+    # [주석] 지역 통합 매핑 사전 정의
+    # 사용자가 선택한 '도' 단위 이름에 대응하는 DB 내의 '세부 지역 키워드'를 리스트로 묶습니다.
+    region_map = {
+        "전라도": ["전남", "전북", "전라"],
+        "경상도": ["경남", "경북", "경상"],
+        "충청도": ["충남", "충북", "충청"],
+        "경기도": ["경기"]
+    }
+
     if region != "전국":
-        df = df[df['region'].str.contains(region, na=False)]
-    df_s = df.groupby('date').agg(sentiment_index=('sentiment_score', 'mean'), news_count=('sentiment_score', 'count')).reset_index()
-    symbol = 'KS11' if "KOSPI" in asset_type or "코스피" in asset_type else 'KQ11'
+        if region in region_map:
+            # [주석] 선택된 지역이 통합 대상(전라도, 경상도 등)인 경우
+            # 예: '전남' 또는 '전북' 또는 '전라'가 포함된 행만 필터링합니다.
+            search_keywords = "|".join(region_map[region])
+            df = df[df['region'].str.contains(search_keywords, na=False)]
+        else:
+            # [주석] 서울 등 단일 키워드 지역인 경우 기존 방식대로 필터링합니다.
+            df = df[df['region'].str.contains(region, na=False)]
+    
+    if df.empty:
+        return pd.DataFrame()
+
+    # [주석] 필터링된 통합 지역 데이터를 날짜별로 그룹화하여 평균 감성 점수를 계산합니다.
+    df_s = df.groupby('date')['sentiment_score'].mean().reset_index()
+    df_s.columns = ['date', 'sentiment_index']
+    
+    # [주석] 금융 데이터(KOSPI/KOSDAQ) 병합 로직
     if fdr is not None:
         try:
+            symbol = 'KQ11' if "코스닥" in asset_type else 'KS11'
             df_p = fdr.DataReader(symbol, start_date, end_date)[['Close']].reset_index()
             df_p.columns = ['date', 'asset_price']
             df_p['date'] = df_p['date'].dt.date.astype(str)
-            merged = pd.merge(df_s, df_p, on='date', how='inner')
-            if not merged.empty: return merged
-        except: pass
-    df_s['asset_price'] = (2500 if symbol=='KS11' else 800) + (df_s['sentiment_index'] - 0.5).cumsum() * 20
+            
+            # [주석] inner join을 통해 뉴스 감성과 주가 데이터가 모두 존재하는 날짜만 추출합니다.
+            return pd.merge(df_s, df_p, on='date', how='inner')
+        except Exception as e:
+            print(f"FinanceDataReader Error: {e}")
+            pass
+    
     return df_s
 
 # ==========================================
@@ -190,31 +222,49 @@ with mid_col2:
             st.markdown(f'<div style="display:flex; justify-content:space-between; align-items:center; padding:10px 12px; margin-bottom:8px; border-radius:6px; border: 1px solid #f0f2f6; background: linear-gradient(90deg, {bg_color} {fill_pct}%, transparent {fill_pct}%);"><span style="font-weight:bold; color:#333;">{row["rank"]}. {row["issue"]} <span style="font-size:12px; color:#888;">({row["count"]}건)</span></span><span class="{badge}">{badge_icon} {row["score_display"]}</span></div>', unsafe_allow_html=True)
     else: st.info("이슈 데이터가 없습니다.")
 
-# 
 # ==========================================
 # 6. 중단 구역 (Combo Chart)
 # ==========================================
 st.markdown("<br>", unsafe_allow_html=True)
-st.subheader("📊 지역 감성 지수 및 자산 가격 추이")
+st.subheader(f"📊 {selected_region} 감성 지수 및 자산 가격 추이")
 
-# [주석] 사이드바의 asset_type(라디오 버튼 값)을 함수 인자로 전달합니다.
+# [주석] 사용자가 선택한 지역(selected_region)을 인자로 넘겨 해당 지역 데이터만 가져옵니다.
 chart_df = get_chart_data(start_date, end_date, selected_region, asset_type)
 
 if not chart_df.empty:
     fig = go.Figure()
-    # [주석] 범례 이름을 선택된 자산명으로 동적 변경합니다.
-    fig.add_trace(go.Bar(x=chart_df['date'], y=chart_df['sentiment_index'], name="지역 감성 지수", marker_color='rgba(100, 149, 237, 0.6)', yaxis='y1'))
-    fig.add_trace(go.Scatter(x=chart_df['date'], y=chart_df['asset_price'], name=asset_type, line=dict(color='firebrick', width=3), yaxis='y2'))
     
-    # [주석] 오른쪽 Y축 제목도 자산명에 따라 바뀝니다.
+    # [주석] 막대 그래프: 선택된 지역의 일별 감성 점수
+    fig.add_trace(go.Bar(
+        x=chart_df['date'], 
+        y=chart_df['sentiment_index'], 
+        name=f"{selected_region} 감성 지수", 
+        marker_color='rgba(100, 149, 237, 0.6)', 
+        yaxis='y1'
+    ))
+    
+    # [주석] 선 그래프: 선택된 자산(KOSPI/KOSDAQ)의 종가
+    fig.add_trace(go.Scatter(
+        x=chart_df['date'], 
+        y=chart_df['asset_price'], 
+        name=asset_type, 
+        line=dict(color='firebrick', width=3), 
+        yaxis='y2'
+    ))
+    
+    # [주석] 레이아웃 설정: 2개의 Y축을 사용하여 수치 차이를 극복합니다.
     fig.update_layout(
-        yaxis=dict(title="감성 지수", range=[0, 1]), 
+        yaxis=dict(title="감성 지수 (0~1)", range=[0, 1]), 
         yaxis2=dict(title=f"{asset_type} 가격", side="right", overlaying="y", showgrid=False), 
         height=450, 
         template="plotly_white",
+        hovermode="x unified", # [주석] 마우스를 올리면 같은 날짜의 데이터가 동시에 보입니다.
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
     st.plotly_chart(fig, use_container_width=True)
+else:
+    # [주석] 해당 지역에 뉴스 데이터가 없을 경우를 위한 안내 문구입니다.
+    st.warning(f"⚠️ {selected_region} 지역의 해당 기간 내 분석 데이터가 존재하지 않습니다.")
 
 # 하단 탭
 tab1, tab2, tab3, tab4 = st.tabs(["상관관계 분석", "감성 타임라인", "성과 분석", "최신 뉴스"])
